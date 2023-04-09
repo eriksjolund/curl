@@ -25,6 +25,9 @@
  * Pass in a custom socket for libcurl to use.
  * </DESC>
  */
+
+#include <systemd/sd-daemon.h>
+
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -62,7 +65,6 @@ static size_t write_data(void *ptr, size_t size, size_t nmemb, void *stream)
 static int closecb(void *clientp, curl_socket_t item)
 {
   (void)clientp;
-  printf("libcurl wants to close %d now\n", (int)item);
   return 0;
 }
 
@@ -89,13 +91,25 @@ static int sockopt_callback(void *clientp, curl_socket_t curlfd,
   return CURL_SOCKOPT_ALREADY_CONNECTED;
 }
 
-int main(void)
+int main(int argc, char *argv[])
 {
   CURL *curl;
   CURLcode res;
   struct sockaddr_in servaddr;  /*  socket address structure  */
   curl_socket_t sockfd;
 
+  if (argc != 3) {
+    fprintf(stderr, "error: incorrect number of arguments");
+    exit(1);
+  }
+  /* don't allow the special file descriptor names listed in the
+     sd_listen_fds man page */
+  if ((strcmp(argv[1], "unknown") == 0) ||
+      (strcmp(argv[1], "stored") == 0) ||
+      (strcmp(argv[1], "connection") == 0)) {
+    fprintf(stderr, "error: special file descriptor name given");
+    exit(1);
+  }
 #ifdef WIN32
   WSADATA wsaData;
   int initwsa = WSAStartup(MAKEWORD(2, 2), &wsaData);
@@ -111,15 +125,24 @@ int main(void)
      * Note that libcurl will internally think that you connect to the host
      * and port that you specify in the URL option.
      */
-    curl_easy_setopt(curl, CURLOPT_URL, "http://99.99.99.99:9999");
 
-    /* Create the socket "manually" */
-    sockfd = socket(AF_INET, SOCK_STREAM, 0);
-    if(sockfd == CURL_SOCKET_BAD) {
-      printf("Error creating listening socket.\n");
-      return 3;
+    curl_easy_setopt(curl, CURLOPT_URL, argv[2]);
+    char **names = NULL;
+    const int num_fds = sd_listen_fds_with_names(0, &names);
+
+    int num_matches = 0;
+    for (int i = 0; i < num_fds; ++i) {
+      if (strcmp(argv[1], names[i]) == 0) {
+        ++num_matches;
+        sockfd = i + SD_LISTEN_FDS_START;
+      }
     }
-
+    if (num_matches != 1) {
+      fprintf(stderr, "error: this demo expects to be run from a systemd service where a unix-socket is passed in via the systemd directive OpenFile=/path/to/socket:fdname\n");
+      exit(1);
+    }
+    /* TODO: add a check that sockfd really is a AF_UNIX socket.
+     */
     memset(&servaddr, 0, sizeof(servaddr));
     servaddr.sin_family = AF_INET;
     servaddr.sin_port   = htons(PORTNUM);
@@ -130,12 +153,6 @@ int main(void)
       return 2;
     }
 
-    if(connect(sockfd, (struct sockaddr *) &servaddr, sizeof(servaddr)) ==
-       -1) {
-      close(sockfd);
-      printf("client error: connect: %s\n", strerror(errno));
-      return 1;
-    }
 
     /* no progress meter please */
     curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 1L);
@@ -154,7 +171,7 @@ int main(void)
     /* call this function to set options for the socket */
     curl_easy_setopt(curl, CURLOPT_SOCKOPTFUNCTION, sockopt_callback);
 
-    curl_easy_setopt(curl, CURLOPT_VERBOSE, 1);
+    curl_easy_setopt(curl, CURLOPT_VERBOSE, 0);
 
     res = curl_easy_perform(curl);
 
